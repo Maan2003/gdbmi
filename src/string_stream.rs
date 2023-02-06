@@ -20,6 +20,10 @@ impl StringStream {
         buf
     }
 
+    pub(crate) fn at(&self, ch: u8) -> bool {
+        self.raw_text.as_bytes()[self.index] == ch
+    }
+
     pub(crate) fn seek_back(&mut self, offset: usize) {
         self.index = self.index.saturating_sub(offset);
     }
@@ -54,6 +58,17 @@ impl StringStream {
                     // Get the next char that is being escaped
                     let c2 = self.raw_text.as_bytes()[self.index] as char;
                     self.index += 1;
+                    let c2 = match c2 {
+                        '\'' => '\'',
+                        '\\' => '\\',
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '"' => '"',
+                        'e' => '\u{033}',
+                        'f' => ' ',
+                        other => unimplemented!("unknown escape character {other}"),
+                    };
                     // only store the escaped character in the buffer; don't store the backslash
                     // (don't leave it escaped)
                     buf.push(c2);

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, io, num::NonZeroUsize};
+use std::{
+    collections::HashMap,
+    io::{self},
+    num::NonZeroUsize,
+};
 
 use crate::{
     parser::{self, parse_message},
@@ -7,9 +11,10 @@ use crate::{
     Token,
 };
 
+use futures::{Sink, Stream, StreamExt, SinkExt};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process, select,
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    select,
     sync::mpsc,
 };
 use tracing::{debug, error, info, warn};
@@ -45,9 +50,12 @@ pub(super) enum Msg {
     },
 }
 
-pub(super) fn spawn(cmd: process::Child) -> mpsc::UnboundedSender<Msg> {
+pub(super) fn spawn(
+    read: impl Stream<Item = String> + Send + 'static,
+    write: impl Sink<String> + Send + 'static,
+) -> mpsc::UnboundedSender<Msg> {
     let (tx, rx) = mpsc::unbounded_channel::<Msg>();
-    tokio::spawn(async move { mainloop(cmd, rx).await });
+    tokio::spawn(async move { mainloop(read, write, rx).await });
     tx
 }
 
@@ -63,9 +71,7 @@ struct PendingConsole {
 #[derive(derivative::Derivative)]
 #[derivative(Debug)]
 struct State {
-    stdin: process::ChildStdin,
-    stdout: BufReader<process::ChildStdout>,
-    stderr: BufReader<process::ChildStderr>,
+    #[derivative(Debug = "ignore")]
     stdout_buf: String,
     stderr_buf: String,
     status: Status,
@@ -78,26 +84,13 @@ struct State {
     pending_console: Option<PendingConsole>,
 }
 
-async fn mainloop(mut cmd: process::Child, mut rx: mpsc::UnboundedReceiver<Msg>) {
-    let stdin = cmd
-        .stdin
-        .take()
-        .expect("Stdin not captured. See docs of Gdb::new");
-    let stdout = BufReader::new(
-        cmd.stdout
-            .take()
-            .expect("Stdout not captured. See docs of Gdb::new"),
-    );
-    let stderr = BufReader::new(
-        cmd.stderr
-            .take()
-            .expect("Stderr not captured. See docs of Gdb::new"),
-    );
-
+async fn mainloop(
+    read: impl Stream<Item = String>,
+    write: impl Sink<String>,
+    mut rx: mpsc::UnboundedReceiver<Msg>,
+) {
+    info!("starting main loop");
     let mut state = State {
-        stdin,
-        stdout,
-        stderr,
         stdout_buf: String::new(),
         stderr_buf: String::new(),
         status: Status::Unstarted,
@@ -108,27 +101,31 @@ async fn mainloop(mut cmd: process::Child, mut rx: mpsc::UnboundedReceiver<Msg>)
         pending_console: None,
     };
 
+    tokio::pin!(read);
+    tokio::pin!(write);
     loop {
         select! {
-            // Don't pull any new command while we're waiting for console output
-            msg = rx.recv(), if &state.pending_console.is_none() => {
-                if let Err(err) = process_msg(msg, &mut state).await {
+            // // Don't pull any new command while we're waiting for console output
+            msg = rx.recv() => {
+                if let Err(err) = process_msg(&mut write, msg, &mut state).await {
                     if log_and_check_fatal(&state, err) {
                         break
                     }
                 }
             }
 
-            result = state.stdout.read_line(&mut state.stdout_buf) => {
-                if let Err(err) = process_stdout(result, &mut state).await {
-                    if log_and_check_fatal(&state, err) {
-                        break
+            maybe_string = read.next() => {
+                match maybe_string {
+                    None => {
+                        info!("Read channel closed");
+                        // continue;
+                        break;
+                    }
+                    Some(s) => {
+                        state.stdout_buf = s;
                     }
                 }
-            }
-
-            result = state.stderr.read_line(&mut state.stderr_buf) => {
-                if let Err(err) = process_stderr(result, &mut state).await {
+                if let Err(err) = process_stdout(&mut state).await {
                     if log_and_check_fatal(&state, err) {
                         break
                     }
@@ -190,12 +187,16 @@ impl<T> From<mpsc::error::SendError<T>> for FatalError {
     }
 }
 
-async fn process_msg(msg: Option<Msg>, state: &mut State) -> Result<(), Error> {
+async fn process_msg(
+    write: &mut (impl Sink<String> + Unpin),
+    msg: Option<Msg>,
+    state: &mut State,
+) -> Result<(), Error> {
     let msg = msg.ok_or(FatalError::RequestChanClosed)?;
 
     match msg {
         Msg::Cmd { token, msg, out } => {
-            write_stdin(&mut state.stdin, token, &msg).await?;
+            write_input(write, token, &msg).await?;
             state.pending.insert(token, out);
         }
 
@@ -212,7 +213,7 @@ async fn process_msg(msg: Option<Msg>, state: &mut State) -> Result<(), Error> {
                 target: capture_lines,
                 out,
             });
-            write_stdin(&mut state.stdin, token, &msg).await?;
+            write_input(write, token, &msg).await?;
         }
 
         Msg::PopGeneral(out) => {
@@ -249,8 +250,8 @@ async fn process_msg(msg: Option<Msg>, state: &mut State) -> Result<(), Error> {
     Ok(())
 }
 
-async fn write_stdin(
-    stdin: &mut process::ChildStdin,
+async fn write_input(
+    mut write: &mut (impl Sink<String> + Unpin),
     token: Token,
     msg: &str,
 ) -> Result<(), FatalError> {
@@ -258,18 +259,14 @@ async fn write_stdin(
     input.push_str(&msg);
     input.push('\n');
 
-    info!("Sending to gdb {}", input);
-    stdin
-        .write_all(&input.as_bytes())
-        .await
-        .map_err(FatalError::Stdin)?;
+    info!("Sending to gdb {:?}", input);
+    write.send(input).await;
+    write.flush().await;
 
     Ok(())
 }
 
-async fn process_stdout(result: io::Result<usize>, state: &mut State) -> Result<(), Error> {
-    result.map_err(FatalError::Stdout)?;
-
+async fn process_stdout(state: &mut State) -> Result<(), Error> {
     let line = &state.stdout_buf[..state.stdout_buf.len() - 1]; // strip the newline
     debug!("Got stdout: {}", line);
     let response = parse_message(&line).map_err(TransientError::from)?;
@@ -418,18 +415,6 @@ async fn process_parsed_general(
 
     info!("Got general message: {:?}", general);
     state.pending_general.push(general);
-
-    Ok(())
-}
-
-async fn process_stderr(result: io::Result<usize>, state: &mut State) -> Result<(), Error> {
-    result.map_err(FatalError::Stderr)?;
-
-    let line = &state.stderr_buf[..state.stderr_buf.len() - 1]; // strip the newline
-    debug!("Got stderr: {}", line);
-    let message = GeneralMessage::InferiorStderr(line.into());
-    state.pending_general.push(message);
-    state.stderr_buf.clear();
 
     Ok(())
 }

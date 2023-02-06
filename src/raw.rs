@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
 use camino::Utf8PathBuf;
 use tracing::{error, warn};
@@ -49,7 +49,7 @@ pub enum Value {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Dict(HashMap<String, Value>);
+pub struct Dict(pub HashMap<String, Value>);
 
 pub type List = Vec<Value>;
 

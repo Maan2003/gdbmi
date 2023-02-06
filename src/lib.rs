@@ -6,16 +6,22 @@
 #![warn(clippy::all, clippy::pedantic, clippy::cargo)]
 #![allow(clippy::missing_errors_doc)]
 use std::{
-    borrow::Cow, collections::HashMap, fmt, num::NonZeroUsize, process::Stdio, time::Duration,
+    borrow::Cow, collections::HashMap, fmt, num::NonZeroUsize, process::Stdio, time::Duration, sync::atomic::AtomicU32,
 };
 
 use breakpoint::{Breakpoint, LineSpec};
 use camino::Utf8PathBuf;
 use checkpoint::Checkpoint;
 use frame::Frame;
+use futures::{Sink, Stream};
 use rand::Rng;
 use status::Status;
-use tokio::{io, process, sync::mpsc, time};
+use tokio::{
+    io::{self, AsyncRead, AsyncWrite},
+    process,
+    sync::mpsc,
+    time,
+};
 use tracing::{debug, error, info};
 use variable::Variable;
 
@@ -216,13 +222,16 @@ impl GdbBuilder {
             },
         );
 
-        let cmd = cmd
+        let mut cmd = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
 
-        Ok(Gdb::new(cmd, self.timeout))
+        let stdin = cmd.stdin.take().unwrap();
+        let stdout = cmd.stdout.take().unwrap();
+        todo!("spawning not implemented");
+        // Ok(Gdb::new(stdout, stdin, self.timeout))
     }
 }
 
@@ -344,6 +353,7 @@ impl Gdb {
     where
         P: Fn(&Status) -> bool + Send + Sync + 'static,
     {
+        info!("awaiting status");
         let timeout = timeout.unwrap_or(self.timeout);
         let (out_tx, out_rx) = mpsc::channel(1);
         self.worker_send(worker::Msg::AwaitStatus {
@@ -486,9 +496,9 @@ impl Gdb {
     /// If `frame_filters` is false python frame filters will be skipped
     pub async fn stack_list_variables(&self, frame_filters: bool) -> Result<Vec<Variable>, Error> {
         let msg = if frame_filters {
-            "-stack-list-variables --simple-values"
+            "-stack-list-variables 1"
         } else {
-            "-stack-list-variables --no-frame-filters --simple-values"
+            "-stack-list-variables --no-frame-filters 1"
         };
         let payload = self.raw_cmd(msg).await?.expect_result()?.expect_payload()?;
         variable::from_stack_list(payload)
@@ -672,8 +682,13 @@ impl Gdb {
     /// # });
     /// ```
     #[must_use]
-    pub fn new(cmd: process::Child, timeout: Duration) -> Self {
-        let worker = worker::spawn(cmd);
+    pub fn new(
+        read: impl Stream<Item = String> + Send + 'static,
+        write: impl Sink<String> + Send + 'static,
+        timeout: Duration,
+    ) -> Self {
+        info!("starting gdb");
+        let worker = worker::spawn(read, write);
         Self { worker, timeout }
     }
 
@@ -722,11 +737,13 @@ fn escape_arg(arg: impl AsRef<str>) -> String {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-struct Token(u32);
+pub struct Token(pub u32);
 
 impl Token {
     fn generate() -> Self {
-        Self(rand::thread_rng().gen())
+        static TOKEN: AtomicU32 = AtomicU32::new(0);
+        let token = TOKEN.fetch_add(0, std::sync::atomic::Ordering::SeqCst);
+        Self(token)
     }
 
     pub(crate) fn serialize(self) -> String {

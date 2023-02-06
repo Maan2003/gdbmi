@@ -23,13 +23,13 @@ pub enum Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Message {
+pub enum Message {
     Response(Response),
     General(GeneralMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Response {
+pub enum Response {
     Notify {
         token: Option<Token>,
         message: String,
@@ -42,6 +42,17 @@ pub(crate) enum Response {
     },
 }
 
+impl Message {
+    pub fn expect_response(self) -> crate::raw::ResultResponse {
+        match self {
+            Message::Response(res) => crate::raw::Response::from_parsed(res)
+                .expect("expect response")
+                .expect_result()
+                .expect("expected result"),
+            Message::General(msg) => panic!("expect a response"),
+        }
+    }
+}
 impl Response {
     pub(crate) fn token(&self) -> Option<Token> {
         match self {
@@ -66,7 +77,8 @@ impl From<Response> for Message {
 ///
 /// See <https://sourceware.org/gdb/onlinedocs/gdb/GDB_002fMI-Stream-Records.html#GDB_002fMI-Stream-Records>
 /// for details on types of gdb mi output.
-pub(crate) fn parse_message(i: &str) -> Result<Message> {
+pub fn parse_message(i: &str) -> Result<Message> {
+    let i = i.trim();
     assert!(!i.contains('\n'));
     let mut stream = StringStream::new(i.to_owned());
 
@@ -88,15 +100,19 @@ pub(crate) fn parse_message(i: &str) -> Result<Message> {
         }
         .into();
         Ok(resp)
-    } else if let Some(caps) = CONSOLE_RE.captures(i) {
-        let message = caps.get(1).unwrap().as_str().to_owned();
+    } else if stream.at(b'~') {
+        // advance ~ and "
+        stream.read(2);
+        let message = stream.advance_past_string_with_gdb_escapes();
         Ok(GeneralMessage::Console(message).into())
-    } else if let Some(caps) = LOG_RE.captures(i) {
-        let payload = caps.get(1).unwrap().as_str().to_owned();
-        Ok(GeneralMessage::Log(payload).into())
-    } else if let Some(caps) = TARGET_OUTPUT_RE.captures(i) {
-        let payload = caps.get(1).unwrap().as_str().to_owned();
-        Ok(GeneralMessage::Target(payload).into())
+    } else if stream.at(b'&'){
+        stream.read(2);
+        let message = stream.advance_past_string_with_gdb_escapes();
+        Ok(GeneralMessage::Log(message).into())
+    } else if stream.at(b'@'){
+        stream.read(2);
+        let message = stream.advance_past_string_with_gdb_escapes();
+        Ok(GeneralMessage::Target(message).into())
     } else if RESPONSE_FINISHED_RE.is_match(i) {
         Ok(GeneralMessage::Done.into())
     } else {
